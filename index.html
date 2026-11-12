@@ -238,6 +238,7 @@ label input,label select,label textarea{text-transform:none;letter-spacing:0;fon
       <button class="btn primary" id="btnNew">＋ Trade Baru</button>
       <button class="btn" id="btnData">⤓ Data</button>
       <button class="btn" id="btnSet">⚙ Pengaturan</button>
+      <select class="inl" id="curSel" title="Tampilkan nominal dalam mata uang…"></select>
       <span class="whoami"><span id="userEmail"></span><button class="btn sm" id="btnOut">Keluar</button></span>
     </div>
   </header>
@@ -307,10 +308,51 @@ const saveSettings = () => { try { localStorage.setItem('jt_settings', JSON.stri
 const applyColor = () => document.body.classList.toggle('color', S.color === 'color');
 
 const nf = (v, d = 2) => Number(v).toLocaleString('id-ID', {minimumFractionDigits:d, maximumFractionDigits:d});
-const moneyDec = v => /^\s*rp\.?\s*$/i.test(S.cur) ? 0 : (Math.abs(v) >= 100000 ? 0 : 2);
+const CUR = {
+  IDR:{sym:'Rp', name:'Rupiah (IDR)'}, USD:{sym:'$', name:'Dolar AS (USD)'}, EUR:{sym:'€', name:'Euro (EUR)'},
+  SGD:{sym:'S$', name:'Dolar Singapura (SGD)'}, MYR:{sym:'RM', name:'Ringgit (MYR)'}, JPY:{sym:'¥', name:'Yen (JPY)'}, AUD:{sym:'A$', name:'Dolar Australia (AUD)'}};
+const codeFromCur = c => {
+  c = String(c || '').trim(); const u = c.toUpperCase(); if (CUR[u]) return u;
+  if (/^rp\.?$/i.test(c)) return 'IDR'; return Object.keys(CUR).find(k => CUR[k].sym === c) || 'USD';
+};
+const loadLS = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || 'null') || d; } catch { return d; } };
+const VIEW = Object.assign({show:'', mode:'auto', manual:null, manualFor:''}, loadLS('jt_view', {}));
+const saveView = () => { try { localStorage.setItem('jt_view', JSON.stringify(VIEW)); } catch {} };
+let RATES = loadLS('jt_rates', {t:0, rates:null}), ratePromise = null;
+const acctCode = () => S.acct || codeFromCur(S.cur);
+const showCode = () => VIEW.show && CUR[VIEW.show] ? VIEW.show : acctCode();
+function rateFactor() { // jumlah mata uang tampilan untuk 1 mata uang akun
+  const a = acctCode(), c = showCode(); if (a === c) return 1;
+  if (VIEW.mode === 'manual' && VIEW.manual > 0 && VIEW.manualFor === a + '>' + c) return VIEW.manual;
+  const r = RATES.rates; if (r && r[a] && r[c]) return r[c] / r[a];
+  return null;
+}
+const dispCode = () => rateFactor() == null ? acctCode() : showCode();
+const conv = v => { const f = rateFactor(); return f == null ? v : v * f; };
+function ensureRates(force) {
+  if (!force && RATES.rates && Date.now() - RATES.t < 12 * 3600e3) return Promise.resolve(true);
+  if (ratePromise) return ratePromise;
+  ratePromise = (async () => {
+    for (const u of ['https://open.er-api.com/v6/latest/USD', 'https://api.frankfurter.dev/v1/latest?base=USD']) {
+      try {
+        const r = await fetch(u); if (!r.ok) continue;
+        const j = await r.json(), rates = j && j.rates; if (rates && rates.IDR) { rates.USD = 1; RATES = {t:Date.now(), rates}; try { localStorage.setItem('jt_rates', JSON.stringify(RATES)); } catch {} return true; }
+      } catch {}
+    }
+    return !!RATES.rates;
+  })().finally(() => { ratePromise = null; });
+  return ratePromise;
+}
+function rateNote() {
+  const a = acctCode(), c = dispCode(); if (a === c) return '';
+  const f = rateFactor(), src = VIEW.mode === 'manual' && VIEW.manualFor === a + '>' + showCode() ? 'kurs manual' : 'kurs terbaru';
+  const txt = c === 'USD' ? `1 USD = ${CUR[a].sym}${nf(1 / f, a === 'IDR' || a === 'JPY' ? 0 : 2)}` : a === 'USD' ? `1 USD = ${CUR[c].sym}${nf(f, c === 'IDR' || c === 'JPY' ? 0 : 2)}` : `1 ${a} = ${nf(f, 4)} ${c}`;
+  return `ditampilkan dalam ${c} (${txt}, ${src})`;
+}
+const moneyDec = (x, code) => (code === 'IDR' || code === 'JPY') ? 0 : (Math.abs(x) >= 100000 ? 0 : 2);
 const money = (v, sign = true) => {
-  const d = moneyDec(v), a = Math.abs(v), nz = Number(a.toFixed(d)) > 0;
-  return `${nz && v < 0 ? '−' : (nz && sign && v > 0 ? '+' : '')}${S.cur}${nf(a, d)}`;
+  const code = dispCode(), x = conv(v), d = moneyDec(x, code), a = Math.abs(x), nz = Number(a.toFixed(d)) > 0;
+  return `${nz && x < 0 ? '−' : (nz && sign && x > 0 ? '+' : '')}${CUR[code].sym}${nf(a, d)}`;
 };
 const compact = v => {
   const a = Math.abs(v), sg = v < 0 ? '−' : '';
@@ -368,13 +410,13 @@ async function signMany(paths) {
 }
 function applySettingsRow(r) {
   if (!r) return;
-  S.balance = r.balance ?? S.balance; S.cur = r.cur || S.cur; S.dailyLoss = r.daily_loss ?? S.dailyLoss;
+  S.balance = r.balance ?? S.balance; S.cur = r.cur || S.cur; S.acct = codeFromCur(S.cur); S.dailyLoss = r.daily_loss ?? S.dailyLoss;
   S.dailyTarget = r.daily_target ?? S.dailyTarget; S.color = r.color || S.color;
   const a = parseJSON(r.setups, []); if (Array.isArray(a) && a.length) S.setups = a;
   applyColor();
 }
 async function cloudSaveSettings() {
-  const {error} = await sb.from('user_settings').upsert({user_id:USER.id, balance:S.balance, cur:S.cur, daily_loss:S.dailyLoss,
+  const {error} = await sb.from('user_settings').upsert({user_id:USER.id, balance:S.balance, cur:acctCode(), daily_loss:S.dailyLoss,
     daily_target:S.dailyTarget, color:S.color, setups:JSON.stringify(S.setups)});
   if (error) throw error;
 }
@@ -555,7 +597,7 @@ function renderDashboard(anim = true) {
   const wrDash = st.winrate / 100 * 201.06;
   root.innerHTML = `
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:10px;flex-wrap:wrap">
-    <div class="sub">Ringkasan performa — ${st.n} trade selesai${st.open ? `, ${st.open} masih berjalan` : ''}</div>${periodSel}
+    <div class="sub">Ringkasan performa — ${st.n} trade selesai${st.open ? `, ${st.open} masih berjalan` : ''}${rateNote() ? ' · ' + rateNote() : ''}</div>${periodSel}
   </div>
   ${empty ? `<div class="glass card empty"><div style="font-size:40px">📈</div><h3 style="color:#fff;margin:8px 0">Belum ada trade</h3>
     <p>Klik <b>＋ Trade Baru</b> untuk mulai mencatat, atau pindahkan data lama lewat menu <b>⤓ Data → Impor backup</b>.</p></div>` : ''}
@@ -636,7 +678,7 @@ function renderCalendar() {
     const k = `${mk}-${pad(d)}`, v = map[k];
     const bg = v ? `background:rgba(var(--${v.p >= 0 ? 'pos' : 'neg'}),${0.07 + 0.3 * Math.min(1, Math.abs(v.p) / mx)})` : '';
     h += `<button class="day ${k === today ? 'today' : ''}" data-date="${k}" style="${bg}"><span class="dn">${d}</span>
-      ${v ? `<b class="dp ${cls(v.p)}">${Math.abs(v.p) >= 1000 ? compact(v.p) : nf(v.p, Math.abs(v.p) >= 100 ? 0 : 1)}</b><span class="dc">${v.n} trade</span>` : '<span></span>'}</button>`;
+      ${v ? `<b class="dp ${cls(v.p)}">${Math.abs(conv(v.p)) >= 1000 ? compact(conv(v.p)) : nf(conv(v.p), Math.abs(conv(v.p)) >= 100 ? 0 : 1)}</b><span class="dc">${v.n} trade</span>` : '<span></span>'}</button>`;
   }
   const tot = sum(vals);
   $('#calTitle').textContent = `${MONL[m]} ${y}`;
@@ -671,7 +713,7 @@ function drawEquity(prog, hov) {
   let lo = Math.min(...eqData.map(p => p.v)), hi = Math.max(...eqData.map(p => p.v));
   if (hi === lo) { hi += 1; lo -= 1; } const pd = (hi - lo) * .12; lo -= pd; hi += pd;
   g.font = '11px Consolas, monospace';
-  const labs = [0, 1, 2, 3, 4].map(i => S.cur + compact(lo + (hi - lo) * i / 4));
+  const labs = [0, 1, 2, 3, 4].map(i => CUR[dispCode()].sym + compact(conv(lo + (hi - lo) * i / 4)));
   P.l = Math.max(56, Math.ceil(Math.max(...labs.map(t => g.measureText(t).width))) + 18);
   const X = i => P.l + (n === 1 ? 0 : i / (n - 1)) * (w - P.l - P.r), Y = v => P.t + (1 - (v - lo) / (hi - lo)) * (h - P.t - P.b);
   g.font = '11px Consolas, monospace'; g.textBaseline = 'middle';
@@ -857,7 +899,7 @@ function openForm(trade, pre = []) {
     </div>
     <div class="g g4">
       <label>Harga Exit<input type="number" step="any" id="f_exit" value="${v(t.exit)}"></label>
-      <label>Profit / Loss (${esc(S.cur)})<input type="number" step="any" id="f_pnl" value="${v(t.pnl)}" placeholder="kosong = masih berjalan"></label>
+      <label>Profit / Loss (${esc(CUR[acctCode()].sym)} · mata uang akun)<input type="number" step="any" id="f_pnl" value="${v(t.pnl)}" placeholder="kosong = masih berjalan"></label>
       <label>Sesi<select id="f_sess">${SESS.map(s => `<option ${t.session === s[0] ? 'selected' : ''}>${s[0]}</option>`).join('')}</select></label>
       <label>R-multiple<div class="rprev" id="rPrev" style="padding:9px 0">—</div></label>
     </div>
@@ -1000,26 +1042,37 @@ function openData() {
     trades.length = 0; closeModal(); renderAll(); toast('Semua data dihapus');
   };
 }
+const curOpts = sel => Object.keys(CUR).map(k => `<option value="${k}" ${k === sel ? 'selected' : ''}>${CUR[k].name}</option>`).join('');
 function openSettings() {
   const m = openModal(`<div class="mhead"><h2>PENGATURAN</h2><button class="x" data-close>✕</button></div>
   <div class="mbody">
     <div class="g g3">
-      <label>Saldo awal<input type="number" step="any" id="s_bal" value="${S.balance}"></label>
-      <label>Simbol mata uang<input id="s_cur" value="${esc(S.cur)}" maxlength="4"></label>
+      <label>Saldo awal (mata uang akun)<input type="number" step="any" id="s_bal" value="${S.balance}"></label>
+      <label>Mata uang akun<select id="s_acct">${curOpts(acctCode())}</select></label>
       <label>Warna profit/loss<select id="s_col"><option value="mono" ${S.color === 'mono' ? 'selected' : ''}>Monokrom (putih/abu)</option><option value="color" ${S.color === 'color' ? 'selected' : ''}>Hijau / Merah</option></select></label>
     </div>
+    <div class="g g3">
+      <label>Tampilkan nominal dalam<select id="s_show">${curOpts(showCode())}</select></label>
+      <label>Kurs<select id="s_rmode"><option value="auto" ${VIEW.mode !== 'manual' ? 'selected' : ''}>Otomatis (terbaru)</option><option value="manual" ${VIEW.mode === 'manual' ? 'selected' : ''}>Manual</option></select></label>
+      <label>Kurs manual (1 akun = ? tampilan)<input type="number" step="any" id="s_rman" value="${VIEW.manual ?? ''}"></label>
+    </div>
+    <p class="sub" style="margin:-4px 0 14px;line-height:1.5">Data trade tersimpan dalam <b>mata uang akun</b>. Pilihan <b>Tampilkan nominal dalam</b> hanya mengubah tampilan (angka asli tidak berubah). Ubah <i>mata uang akun</i> hanya jika angka yang Anda masukkan memang dalam mata uang itu. ${rateNote() ? '<br>Saat ini: ' + esc(rateNote()) + '.' : ''}</p>
     <div class="g g2">
-      <label>Batas rugi harian<input type="number" step="any" id="s_dl" value="${S.dailyLoss}"></label>
-      <label>Target profit harian<input type="number" step="any" id="s_dt" value="${S.dailyTarget}"></label>
+      <label>Batas rugi harian (mata uang akun)<input type="number" step="any" id="s_dl" value="${S.dailyLoss}"></label>
+      <label>Target profit harian (mata uang akun)<input type="number" step="any" id="s_dt" value="${S.dailyTarget}"></label>
     </div>
     <div class="g"><label>Daftar setup / strategi (pisahkan koma)<input id="s_set" value="${esc(S.setups.join(', '))}"></label></div>
   </div>
   <div class="mfoot"><button class="btn" data-close>Batal</button><button class="btn primary" id="sSave">Simpan</button></div>`, 'mid');
   $('#sSave').onclick = async () => {
-    S.balance = num($('#s_bal').value) ?? 0; S.cur = $('#s_cur').value || '$'; S.color = $('#s_col').value;
+    const newAcct = $('#s_acct').value;
+    if (newAcct !== acctCode() && trades.length && !await confirmBox('Mengubah <b>mata uang akun</b> tidak mengonversi angka yang sudah tersimpan — angkanya akan dianggap sebagai ' + newAcct + '. Jika Anda hanya ingin MELIHAT dalam mata uang lain, pakai pilihan "Tampilkan nominal dalam". Tetap ubah?', 'Ya, ubah')) return;
+    S.acct = newAcct; S.cur = newAcct;
+    VIEW.show = $('#s_show').value; VIEW.mode = $('#s_rmode').value; VIEW.manual = num($('#s_rman').value); VIEW.manualFor = S.acct + '>' + VIEW.show; saveView();
+    S.balance = num($('#s_bal').value) ?? 0; S.color = $('#s_col').value;
     S.dailyLoss = num($('#s_dl').value) ?? 0; S.dailyTarget = num($('#s_dt').value) ?? 0;
     S.setups = $('#s_set').value.split(',').map(x => x.trim()).filter(Boolean);
-    saveSettings(); applyColor(); try { await cloudSaveSettings(); } catch (e) { toast('Gagal menyimpan pengaturan: ' + errMsg(e)); return; } closeModal(); renderAll(); toast('Pengaturan disimpan ✓');
+    saveSettings(); applyColor(); try { await cloudSaveSettings(); } catch (e) { toast('Gagal menyimpan pengaturan: ' + errMsg(e)); return; } closeModal(); syncCurSel(); renderAll(); toast('Pengaturan disimpan ✓'); ensureRates().then(() => { syncCurSel(); renderAll(); });
   };
 }
 
@@ -1033,6 +1086,19 @@ function setView(v) {
 function renderAll() { if (state.view === 'dashboard') renderDashboard(false); else renderJournal(); }
 $$('.tab').forEach(b => b.onclick = () => setView(b.dataset.view));
 $('#btnNew').onclick = () => openForm(null); $('#btnData').onclick = openData; $('#btnSet').onclick = openSettings;
+
+/* ============================ pilihan mata uang cepat ============================ */
+function syncCurSel() {
+  const el = $('#curSel'); if (!el) return;
+  if (!el.options.length) el.innerHTML = Object.keys(CUR).map(k => `<option value="${k}">${k}</option>`).join('');
+  el.value = dispCode();
+}
+$('#curSel').onchange = async e => {
+  VIEW.show = e.target.value; saveView(); renderAll();
+  const ok = await ensureRates();
+  if (showCode() !== acctCode() && rateFactor() == null) toast('Kurs belum tersedia. Cek internet atau isi kurs manual di Pengaturan.');
+  syncCurSel(); renderAll();
+};
 
 /* ============================ login ============================ */
 const loginMsg = (m, ok) => { const e = $('#loginMsg'); e.textContent = m || ''; e.style.color = ok ? '#d1d5db' : '#fff'; };
@@ -1052,6 +1118,7 @@ async function showApp() {
   toast('Memuat data…');
   try { await cloudLoad(); } catch (e) { toast('Gagal memuat data: ' + errMsg(e)); }
   setView(state.view || 'dashboard');
+  syncCurSel(); ensureRates().then(() => { syncCurSel(); if (showCode() !== acctCode()) renderAll(); });
 }
 function initAuth() {
   if (!window.supabase) { showLogin('Gagal memuat Supabase. Periksa koneksi internet lalu muat ulang.'); return; }
@@ -1086,7 +1153,7 @@ $('#recForm').addEventListener('submit', async e => {
 $('#btnOut').onclick = async () => { await sb.auth.signOut(); };
 
 (function init() {
-  applyColor(); initSessions(); tickClock(); setInterval(tickClock, 1000);
+  applyColor(); syncCurSel(); initSessions(); tickClock(); setInterval(tickClock, 1000);
   initAuth();
 })();
 </script>
